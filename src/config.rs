@@ -18,6 +18,12 @@ step_size = 120
 
 [behavior]
 smooth_stop_ms = 100
+
+# Per-app overrides (optional)
+# [[per_app]]
+# window_class = "Notepad"
+# step_size = 60
+# smooth_stop_ms = 50
 "##;
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -25,6 +31,19 @@ pub struct Config {
     pub hotkeys: HotkeyConfig,
     pub scroll: ScrollConfig,
     pub behavior: BehaviorConfig,
+    #[serde(default)]
+    pub per_app: Vec<PerAppConfig>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PerAppConfig {
+    pub window_class: String,
+    pub step_size: Option<u32>,
+    pub initial_interval_ms: Option<u64>,
+    pub min_interval_ms: Option<u64>,
+    pub acceleration_start_ms: Option<u64>,
+    pub acceleration_max_ms: Option<u64>,
+    pub smooth_stop_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
