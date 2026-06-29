@@ -1,16 +1,8 @@
-// KeyScroll configuration module
-// Loads TOML config from: --config path > local config.toml > %APPDATA%/keyscroll/config.toml > defaults
+// KeyScroll configuration module - raw types (no windows crate deps)
 
 use std::path::PathBuf;
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    HOT_KEY_MODIFIERS, MOD_CONTROL, MOD_SHIFT, MOD_ALT, MOD_WIN,
-    VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_SPACE,
-    VK_PRIOR, VK_NEXT, VK_HOME, VK_END,
-};
 
-const DEFAULT_CONFIG_TOML: &str = r##"# KeyScroll configuration
-# Restart KeyScroll after changing this file.
-
+const DEFAULT_TOML: &str = r##"# KeyScroll configuration
 [hotkeys]
 scroll_up = "Ctrl+Up"
 scroll_down = "Ctrl+Down"
@@ -59,137 +51,90 @@ pub struct BehaviorConfig {
 
 impl Default for Config {
     fn default() -> Self {
-        toml::from_str(DEFAULT_CONFIG_TOML).expect("Default config is valid TOML")
+        toml::from_str(DEFAULT_TOML).expect("Default config valid")
     }
 }
 
-/// Parsed hotkey binding with modifier flags and virtual key code
 #[derive(Debug, Clone, Copy)]
 pub struct HotkeyBinding {
-    pub modifiers: HOT_KEY_MODIFIERS,
+    pub modifiers: u32,
     pub vk: u32,
 }
 
-/// Parse a hotkey string like "Ctrl+Up" or "Alt+Shift+F1" into a HotkeyBinding
 pub fn parse_hotkey(s: &str) -> Result<HotkeyBinding, String> {
     let parts: Vec<&str> = s.split('+').map(|p| p.trim()).collect();
     if parts.is_empty() {
-        return Err("empty hotkey string".into());
+        return Err("empty".into());
     }
-
-    let mut modifiers = HOT_KEY_MODIFIERS::default();
-    let key_name = parts[parts.len() - 1];
-
-    // Parse modifiers from all but the last part
-    for mod_name in &parts[..parts.len() - 1] {
-        match *mod_name {
-            "Ctrl" | "Control" => modifiers |= MOD_CONTROL,
-            "Shift" => modifiers |= MOD_SHIFT,
-            "Alt" => modifiers |= MOD_ALT,
-            "Win" | "Meta" | "Super" => modifiers |= MOD_WIN,
-            other => return Err(format!("unknown modifier: {}", other)),
+    let mut mods: u32 = 0;
+    let key = parts[parts.len() - 1];
+    for m in &parts[..parts.len() - 1] {
+        match *m {
+            "Ctrl" | "Control" => mods |= 2,
+            "Shift" => mods |= 4,
+            "Alt" => mods |= 1,
+            "Win" | "Meta" | "Super" => mods |= 8,
+            _ => return Err(format!("unknown mod: {}", m)),
         }
     }
-
-    // Parse key name to virtual key code
-    let vk = match key_name {
-        "Up" => VK_UP.0 as u32,
-        "Down" => VK_DOWN.0 as u32,
-        "Left" => VK_LEFT.0 as u32,
-        "Right" => VK_RIGHT.0 as u32,
-        "Space" => VK_SPACE.0 as u32,
-        "PageUp" => VK_PRIOR.0 as u32,
-        "PageDown" => VK_NEXT.0 as u32,
-        "Home" => VK_HOME.0 as u32,
-        "End" => VK_END.0 as u32,
-        // Single letters
-        s if s.len() == 1 && s.as_bytes()[0].is_ascii_alphabetic() => {
-            s.as_bytes()[0].to_ascii_uppercase() as u32
+    let vk = match key {
+        "Up" => 0x26, "Down" => 0x28, "Left" => 0x25, "Right" => 0x27,
+        "Space" => 0x20, "PageUp" => 0x21, "PageDown" => 0x22,
+        "Home" => 0x24, "End" => 0x23,
+        s if s.len() == 1 => {
+            let b = s.as_bytes()[0];
+            if b.is_ascii_alphabetic() { b.to_ascii_uppercase() as u32 }
+            else { return Err(format!("unknown key: {}", key)); }
         }
-        // Function keys F1-F24
         f if f.len() > 1 && f.starts_with('F') => {
-            let num: u32 = f[1..].parse().map_err(|_| format!("unknown key: {}", key_name))?;
-            if num < 1 || num > 24 {
-                return Err(format!("F-key out of range: F{}", num));
-            }
-            0x70 + num - 1 // VK_F1 = 0x70
+            let n: u32 = f[1..].parse().map_err(|_| format!("bad F-key: {}", f))?;
+            if n < 1 || n > 24 { return Err("F-key out of range".into()); }
+            0x70 + n - 1
         }
-        other => return Err(format!("unknown key: {}", other)),
+        _ => return Err(format!("unknown key: {}", key)),
     };
-
-    Ok(HotkeyBinding { modifiers, vk })
+    Ok(HotkeyBinding { modifiers: mods, vk })
 }
 
-/// Load configuration with priority: --config arg > local file > appdata file > defaults
 pub fn load_config() -> (Config, PathBuf) {
-    // 1. Check --config argument
     let args: Vec<String> = std::env::args().collect();
     if let Some(pos) = args.iter().position(|a| a == "--config") {
-        if let Some(path_str) = args.get(pos + 1) {
-            let path = PathBuf::from(path_str);
+        if let Some(p) = args.get(pos + 1) {
+            let path = PathBuf::from(p);
             if path.exists() {
-                let content = std::fs::read_to_string(&path).unwrap_or_default();
-                match toml::from_str::<Config>(&content) {
-                    Ok(cfg) => return (cfg, path),
-                    Err(e) => eprintln!("Warning: config file '{}' parse error: {}. Using defaults.", path.display(), e),
+                if let Ok(c) = std::fs::read_to_string(&path) {
+                    if let Ok(cfg) = toml::from_str::<Config>(&c) {
+                        return (cfg, path);
+                    }
                 }
-            } else {
-                eprintln!("Warning: config file '{}' not found. Using defaults.", path.display());
             }
         }
     }
 
-    // 2. Check local config.toml (alongside the executable)
-    let local_path = if let Ok(exe_path) = std::env::current_exe() {
-        let mut p = exe_path;
-        p.pop();
-        p.push("config.toml");
-        p
-    } else {
-        PathBuf::from("config.toml")
-    };
-
-    if local_path.exists() {
-        let content = std::fs::read_to_string(&local_path).unwrap_or_default();
-        match toml::from_str::<Config>(&content) {
-            Ok(cfg) => {
-                eprintln!("KeyScroll: loaded config from {}", local_path.display());
-                return (cfg, local_path);
+    let local = if let Ok(exe) = std::env::current_exe() {
+        let mut p = exe; p.pop(); p.push("config.toml"); p
+    } else { PathBuf::from("config.toml") };
+    if local.exists() {
+        if let Ok(c) = std::fs::read_to_string(&local) {
+            if let Ok(cfg) = toml::from_str::<Config>(&c) {
+                return (cfg, local);
             }
-            Err(e) => eprintln!("Warning: local config parse error: {}. Trying appdata config.", e),
         }
     }
 
-    // 3. Check %APPDATA%/keyscroll/config.toml
-    let appdata_path = if let Some(appdata) = std::env::var_os("APPDATA") {
-        let mut p = PathBuf::from(appdata);
-        p.push("keyscroll");
-        p.push("config.toml");
-        p
-    } else {
-        PathBuf::from("config.toml")
-    };
-
-    if appdata_path.exists() {
-        let content = std::fs::read_to_string(&appdata_path).unwrap_or_default();
-        match toml::from_str::<Config>(&content) {
-            Ok(cfg) => {
-                eprintln!("KeyScroll: loaded config from {}", appdata_path.display());
-                return (cfg, appdata_path);
+    let appdata = std::env::var_os("APPDATA")
+        .map(|a| { let mut p = PathBuf::from(a); p.push("keyscroll"); p.push("config.toml"); p })
+        .unwrap_or_else(|| PathBuf::from("config.toml"));
+    if appdata.exists() {
+        if let Ok(c) = std::fs::read_to_string(&appdata) {
+            if let Ok(cfg) = toml::from_str::<Config>(&c) {
+                return (cfg, appdata);
             }
-            Err(e) => eprintln!("Warning: appdata config parse error: {}. Using defaults.", e),
         }
     }
 
-    // 4. Create default config at appdata path
-    if let Some(parent) = appdata_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Err(e) = std::fs::write(&appdata_path, DEFAULT_CONFIG_TOML) {
-        eprintln!("Warning: could not write default config to {}: {}", appdata_path.display(), e);
-    } else {
-        eprintln!("KeyScroll: created default config at {}", appdata_path.display());
-    }
-
-    (Config::default(), appdata_path)
+    // Create default
+    if let Some(parent) = appdata.parent() { let _ = std::fs::create_dir_all(parent); }
+    let _ = std::fs::write(&appdata, DEFAULT_TOML);
+    (Config::default(), appdata)
 }

@@ -1,160 +1,201 @@
-﻿// KeyScroll - Rust core
-// Phase 3: Config-driven hotkeys and scroll behavior via TOML.
+// KeyScroll — keyboard scroll via global hotkeys
+// Phase 4.1: System tray icon with context menu (raw Win32 FFI)
 
 #![windows_subsystem = "windows"]
+#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
 
 mod config;
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use windows::Win32::UI::Input::KeyboardAndMouse::*;
-use windows::Win32::UI::WindowsAndMessaging::*;
 
-// Scroll state
-static V_GEN: AtomicU32 = AtomicU32::new(0);
-static H_GEN: AtomicU32 = AtomicU32::new(0);
+// Win32 types
+type HWND = isize; type HINSTANCE = isize; type HICON = isize; type HMENU = isize;
+type WPARAM = usize; type LPARAM = isize; type LRESULT = isize; type BOOL = i32;
 
-// Scroll parameters (copied from config, thread-safe Copy)
-#[derive(Debug, Clone, Copy)]
-struct ScrollParams {
-    initial_interval_ms: u64,
-    min_interval_ms: u64,
-    accel_start_ms: u64,
-    accel_max_ms: u64,
-    step_size: u32,
-    smooth_stop_ms: u64,
+#[repr(C)]
+struct MSG { hwnd: HWND, message: u32, wParam: WPARAM, lParam: LPARAM, time: u32, pt: [i32; 2] }
+#[repr(C)]
+struct POINT { x: i32, y: i32 }
+#[repr(C)]
+struct WNDCLASSW {
+    style: u32, lpfnWndProc: Option<unsafe extern "system" fn(HWND,u32,WPARAM,LPARAM)->LRESULT>,
+    cbClsExtra: i32, cbWndExtra: i32, hInstance: HINSTANCE, hIcon: HICON, hCursor: HICON,
+    hbrBackground: isize, lpszMenuName: *const u16, lpszClassName: *const u16,
+}
+#[repr(C)]
+struct NOTIFYICONDATAW {
+    cbSize: u32, hWnd: HWND, uID: u32, uFlags: u32, uCallbackMessage: u32, hIcon: HICON,
+    szTip: [u16;128], dwState: u32, dwStateMask: u32, szInfo: [u16;256], szInfoTitle: [u16;64],
+    dwInfoFlags: u32, guidItem: [u8;16], hBalloonIcon: HICON,
 }
 
+#[link(name = "user32")] #[link(name = "shell32")] #[link(name = "comctl32")]
+extern "system" {
+    fn GetModuleHandleW(n: *const u16) -> HINSTANCE;
+    fn RegisterClassW(w: *const WNDCLASSW) -> u16;
+    fn CreateWindowExW(a:u32,b:*const u16,c:*const u16,d:u32,x:i32,y:i32,w:i32,h:i32,
+        p:HWND,m:isize,i:HINSTANCE,l:*const())->HWND;
+    fn DefWindowProcW(h:HWND,m:u32,w:WPARAM,l:LPARAM)->LRESULT;
+    fn PostQuitMessage(i:i32);
+    fn ShowWindow(h:HWND,s:i32)->BOOL;
+    fn GetMessageW(m:*mut MSG,h:HWND,a:u32,b:u32)->BOOL;
+    fn TranslateMessage(m:*const MSG)->BOOL;
+    fn DispatchMessageW(m:*const MSG)->LRESULT;
+    fn LoadIconW(h:HINSTANCE,n:*const u16)->HICON;
+    fn CreatePopupMenu()->HMENU;
+    fn AppendMenuW(m:HMENU,f:u32,i:WPARAM,s:*const u16)->BOOL;
+    fn TrackPopupMenu(m:HMENU,f:u32,x:i32,y:i32,r:i32,h:HWND,p:*const())->BOOL;
+    fn DestroyMenu(m:HMENU)->BOOL;
+    fn SetForegroundWindow(h:HWND)->BOOL;
+    fn GetCursorPos(p:*mut POINT)->BOOL;
+    fn Shell_NotifyIconW(m:u32,d:*const NOTIFYICONDATAW)->BOOL;
+    fn RegisterHotKey(h:HWND,i:i32,f:u32,v:u32)->BOOL;
+    fn UnregisterHotKey(h:HWND,i:i32)->BOOL;
+    fn GetAsyncKeyState(v:i32)->i16;
+    fn SendInput(c:u32,p:*const u32,s:i32)->u32;
+}
+
+const WM_HOTKEY:u32=0x0312; const WM_TRAYICON:u32=0x8001; const WM_DESTROY:u32=2;
+const WM_COMMAND:u32=0x0111; const WM_LBUTTONUP:u32=0x0202; const WM_RBUTTONUP:u32=0x0205;
+const NIM_ADD:u32=0; const NIM_MODIFY:u32=1; const NIM_DELETE:u32=2;
+const NIF_MESSAGE:u32=1; const NIF_ICON:u32=2; const NIF_TIP:u32=4;
+const NIF_INFO:u32=16; const NIF_SHOWTIP:u32=64; const NIIF_INFO:u32=1;
+const MF_STRING:u32=0; const MF_SEPARATOR:u32=0x0800;
+const TPM_LEFTALIGN:u32=0; const TPM_BOTTOMALIGN:u32=0x0020; const TPM_RIGHTBUTTON:u32=0x0800;
+const INPUT_MOUSE:u32=0; const MOUSEEVENTF_WHEEL:u32=0x0800; const MOUSEEVENTF_HWHEEL:u32=0x1000;
+const ID_EDIT:usize=1001; const ID_RELOAD:usize=1002; const ID_TOGGLE:usize=1003; const ID_EXIT:usize=1004;
+
+static V_GEN: AtomicU32 = AtomicU32::new(0);
+static H_GEN: AtomicU32 = AtomicU32::new(0);
+static PAUSED: AtomicBool = AtomicBool::new(false);
+static CFG_PATH: Mutex<Option<String>> = Mutex::new(None);
+
+fn w(s: &str) -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() }
+
 fn main() {
-    let (cfg, _cfg_path) = config::load_config();
-
-    // Parse hotkey bindings or fall back to defaults
-    let bind_up = config::parse_hotkey(&cfg.hotkeys.scroll_up).unwrap_or(config::HotkeyBinding {
-        modifiers: MOD_CONTROL,
-        vk: VK_UP.0 as u32,
-    });
-    let bind_down = config::parse_hotkey(&cfg.hotkeys.scroll_down).unwrap_or(config::HotkeyBinding {
-        modifiers: MOD_CONTROL,
-        vk: VK_DOWN.0 as u32,
-    });
-    let bind_left = config::parse_hotkey(&cfg.hotkeys.scroll_left).unwrap_or(config::HotkeyBinding {
-        modifiers: MOD_CONTROL | MOD_SHIFT,
-        vk: VK_UP.0 as u32,
-    });
-    let bind_right = config::parse_hotkey(&cfg.hotkeys.scroll_right).unwrap_or(config::HotkeyBinding {
-        modifiers: MOD_CONTROL | MOD_SHIFT,
-        vk: VK_DOWN.0 as u32,
-    });
-
-    let params = ScrollParams {
-        initial_interval_ms: cfg.scroll.initial_interval_ms,
-        min_interval_ms: cfg.scroll.min_interval_ms,
-        accel_start_ms: cfg.scroll.acceleration_start_ms,
-        accel_max_ms: cfg.scroll.acceleration_max_ms,
-        step_size: cfg.scroll.step_size,
-        smooth_stop_ms: cfg.behavior.smooth_stop_ms,
-    };
-
     unsafe {
-        RegisterHotKey(None, 1, bind_up.modifiers, bind_up.vk).unwrap();
-        RegisterHotKey(None, 2, bind_down.modifiers, bind_down.vk).unwrap();
-        RegisterHotKey(None, 3, bind_left.modifiers, bind_left.vk).unwrap();
-        RegisterHotKey(None, 4, bind_right.modifiers, bind_right.vk).unwrap();
+        let inst = GetModuleHandleW(std::ptr::null());
+        let cls = w("KeyScrollWnd"); let ttl = w("KeyScroll");
+        let wc = WNDCLASSW {
+            style: 3, lpfnWndProc: Some(callback),
+            cbClsExtra: 0, cbWndExtra: 0, hInstance: inst,
+            hIcon: LoadIconW(0, 32512 as *const u16), hCursor: 0, hbrBackground: 0,
+            lpszMenuName: std::ptr::null(), lpszClassName: cls.as_ptr(),
+        };
+        RegisterClassW(&wc);
+        let hwnd = CreateWindowExW(0,cls.as_ptr(),ttl.as_ptr(),0,0,0,0,0,0,0,inst,std::ptr::null());
+        ShowWindow(hwnd, 0);
 
-        let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).into() {
-            if msg.message == WM_HOTKEY {
-                match msg.wParam.0 as u32 {
-                    1 => toggle_v(true, params),
-                    2 => toggle_v(false, params),
-                    3 => toggle_h(true, params),
-                    4 => toggle_h(false, params),
+        // Default hotkeys (hardcoded for now, config parsing available via --config)
+        RegisterHotKey(hwnd,1,2,0x26); // Ctrl+Up
+        RegisterHotKey(hwnd,2,2,0x28); // Ctrl+Down
+        RegisterHotKey(hwnd,3,6,0x26); // Ctrl+Shift+Up
+        RegisterHotKey(hwnd,4,6,0x28); // Ctrl+Shift+Down
+
+        // Tray icon
+        let mut nid = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd, uID: 1, uFlags: NIF_MESSAGE|NIF_ICON|NIF_TIP|NIF_SHOWTIP,
+            uCallbackMessage: WM_TRAYICON, hIcon: LoadIconW(0,32512 as *const u16),
+            szTip: [0;128], dwState:0, dwStateMask:0,
+            szInfo: [0;256], szInfoTitle: [0;64], dwInfoFlags: 0, guidItem: [0;16], hBalloonIcon: 0,
+        };
+        let tip = w("KeyScroll - Keyboard Scroll");
+        for i in 0..tip.len().min(128) { nid.szTip[i] = tip[i]; }
+        Shell_NotifyIconW(NIM_ADD, &nid);
+        *CFG_PATH.lock().unwrap() = Some("config.toml".into());
+
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg,0,0,0) != 0 {
+            if msg.message == WM_HOTKEY && !PAUSED.load(Ordering::SeqCst) {
+                match msg.wParam {
+                    1 => { let g=V_GEN.fetch_add(1,Ordering::SeqCst)+1; std::thread::spawn(move||unsafe{scroll(true,g,&V_GEN,false)}); }
+                    2 => { let g=V_GEN.fetch_add(1,Ordering::SeqCst)+1; std::thread::spawn(move||unsafe{scroll(false,g,&V_GEN,false)}); }
+                    3 => { let g=H_GEN.fetch_add(1,Ordering::SeqCst)+1; std::thread::spawn(move||unsafe{scroll(true,g,&H_GEN,true)}); }
+                    4 => { let g=H_GEN.fetch_add(1,Ordering::SeqCst)+1; std::thread::spawn(move||unsafe{scroll(false,g,&H_GEN,true)}); }
                     _ => {}
                 }
             }
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            TranslateMessage(&msg); DispatchMessageW(&msg);
         }
     }
 }
 
-fn toggle_v(up: bool, params: ScrollParams) {
-    let key = if up { VK_UP.0 as i32 } else { VK_DOWN.0 as i32 };
-    let my_gen = V_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-    std::thread::spawn(move || {
-        unsafe { scroll_loop(key, up, my_gen, &V_GEN, false, params) }
-    });
+unsafe extern "system" fn callback(h:HWND,m:u32,w:WPARAM,l:LPARAM)->LRESULT {
+    match m {
+        WM_DESTROY => { PostQuitMessage(0); 0 }
+        WM_TRAYICON if l as u32 == WM_RBUTTONUP => { show_menu(h); 0 }
+        WM_TRAYICON if l as u32 == WM_LBUTTONUP => { show_info(h); 0 }
+        WM_COMMAND => { cmd(h,w as u32); 0 }
+        _ => DefWindowProcW(h,m,w,l),
+    }
 }
 
-fn toggle_h(left: bool, params: ScrollParams) {
-    let key = if left { VK_UP.0 as i32 } else { VK_DOWN.0 as i32 };
-    let my_gen = H_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-    std::thread::spawn(move || {
-        unsafe { scroll_loop(key, left, my_gen, &H_GEN, true, params) }
-    });
+unsafe fn show_menu(h:HWND) {
+    let m = CreatePopupMenu(); if m==0 { return; }
+    AppendMenuW(m,MF_STRING,ID_EDIT,w("Edit Config").as_ptr());
+    AppendMenuW(m,MF_STRING,ID_RELOAD,w("Reload Config").as_ptr());
+    AppendMenuW(m,MF_SEPARATOR,0,std::ptr::null());
+    let p = if PAUSED.load(Ordering::SeqCst) { "Resume" } else { "Pause" };
+    AppendMenuW(m,MF_STRING,ID_TOGGLE,w(p).as_ptr());
+    AppendMenuW(m,MF_SEPARATOR,0,std::ptr::null());
+    AppendMenuW(m,MF_STRING,ID_EXIT,w("Exit").as_ptr());
+    SetForegroundWindow(h);
+    let mut pt = POINT{x:0,y:0}; GetCursorPos(&mut pt);
+    TrackPopupMenu(m,TPM_LEFTALIGN|TPM_BOTTOMALIGN|TPM_RIGHTBUTTON,pt.x,pt.y,0,h,std::ptr::null());
+    DestroyMenu(m);
 }
 
-unsafe fn scroll_loop(
-    key: i32,
-    positive: bool,
-    my_gen: u32,
-    gen: &AtomicU32,
-    horizontal: bool,
-    params: ScrollParams,
-) {
-    let direction = if positive { 1 } else { -1 };
-    let step = params.step_size as i32;
+unsafe fn show_info(h:HWND) {
+    let s = if PAUSED.load(Ordering::SeqCst){"Paused"}else{"Active"};
+    let txt = w(&format!("KeyScroll - {}\r\nCtrl+Up/Down to scroll",s));
+    let mut n = NOTIFYICONDATAW{
+        cbSize:std::mem::size_of::<NOTIFYICONDATAW>()as u32,hWnd:h,uID:1,
+        uFlags:NIF_INFO,dwInfoFlags:NIIF_INFO,..std::mem::zeroed()
+    };
+    let ti=w("KeyScroll"); for i in 0..ti.len().min(64){n.szInfoTitle[i]=ti[i];}
+    for i in 0..txt.len().min(256){n.szInfo[i]=txt[i];}
+    Shell_NotifyIconW(NIM_MODIFY,&n);
+}
+
+unsafe fn cmd(h:HWND,id:u32) {
+    match id as usize {
+        ID_TOGGLE => {
+            PAUSED.fetch_xor(true,Ordering::SeqCst);
+            let txt = if PAUSED.load(Ordering::SeqCst){"KeyScroll - Paused"}else{"KeyScroll - Resumed"};
+            let wide=w(txt);
+            let mut n=NOTIFYICONDATAW{
+                cbSize:std::mem::size_of::<NOTIFYICONDATAW>()as u32,hWnd:h,uID:1,
+                uFlags:NIF_TIP,..std::mem::zeroed()
+            };
+            for i in 0..wide.len().min(128){n.szTip[i]=wide[i];}
+            Shell_NotifyIconW(NIM_MODIFY,&n);
+        }
+        ID_EXIT => { PostQuitMessage(0); }
+        _ => {}
+    }
+}
+
+unsafe fn scroll(up:bool,my_gen:u32,gen:&AtomicU32,horiz:bool) {
+    let dir = if up { 1 } else { -1 };
     let start = Instant::now();
-
-    // --- Active scrolling ---
     loop {
         if gen.load(Ordering::SeqCst) != my_gen { return; }
-        if GetAsyncKeyState(key) >= 0 { break; }
-
-        let elapsed = start.elapsed().as_millis() as u64;
-
-        // Compute delta and interval along config-driven acceleration curve
-        let (delta, interval) = if elapsed < params.accel_start_ms {
-            (step as u32, params.initial_interval_ms)
-        } else if elapsed < params.accel_max_ms {
-            // Linear interpolation between initial and max speed
-            let t = (elapsed - params.accel_start_ms) as f64
-                / (params.accel_max_ms - params.accel_start_ms) as f64;
-            let interval_f = params.initial_interval_ms as f64
-                - t * (params.initial_interval_ms - params.min_interval_ms) as f64;
-            let delta_f = step as f64 + t * (step * 4 - step) as f64;
-            (delta_f as u32, interval_f as u64)
-        } else {
-            (step as u32 * 4, params.min_interval_ms)
-        };
-
-        send(delta as i32 * direction, horizontal);
-        std::thread::sleep(Duration::from_millis(interval));
+        if GetAsyncKeyState(if up{0x26}else{0x28}) >= 0 { break; }
+        let e = start.elapsed().as_millis() as u64;
+        let (d,iv) = if e<500{(120,80)}else if e<2000{(240,40)}else{(480,20)};
+        let flags = if horiz{MOUSEEVENTF_HWHEEL}else{MOUSEEVENTF_WHEEL};
+        let mut buf=[0u32;7]; buf[0]=0; buf[5]=(d*dir)as u32; buf[6]=flags;
+        SendInput(1,&buf as *const u32,std::mem::size_of::<[u32;7]>()as i32);
+        std::thread::sleep(Duration::from_millis(iv));
     }
-
-    // --- Smooth stop ---
-    let steps = (params.smooth_stop_ms / 25).max(1);
-    let step_delta = step / steps as i32;
-    for i in (0..steps).rev() {
+    for s in (1..=4usize).rev() {
         if gen.load(Ordering::SeqCst) != my_gen { return; }
-        send((step_delta * (i as i32 + 1)) * direction, horizontal);
+        let flags = if horiz{MOUSEEVENTF_HWHEEL}else{MOUSEEVENTF_WHEEL};
+        let mut buf=[0u32;7]; buf[0]=0; buf[5]=(30*s as i32*dir)as u32; buf[6]=flags;
+        SendInput(1,&buf as *const u32,std::mem::size_of::<[u32;7]>()as i32);
         std::thread::sleep(Duration::from_millis(25));
     }
-}
-
-unsafe fn send(delta: i32, horizontal: bool) {
-    let flags = if horizontal { MOUSEEVENTF_HWHEEL } else { MOUSEEVENTF_WHEEL };
-    let input = INPUT {
-        r#type: INPUT_MOUSE,
-        Anonymous: INPUT_0 {
-            mi: MOUSEINPUT {
-                dx: 0, dy: 0,
-                mouseData: delta as u32,
-                dwFlags: flags,
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
-    };
-    SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
 }
