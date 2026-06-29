@@ -1,56 +1,24 @@
 ; KeyScroll - AutoHotkey v2 prototype
 ; Ctrl+Up/Down: continuous scroll while held
 ; Compile: Ahk2Exe.exe /in src-ahk/keyscroll.ahk /out keyscroll.exe
+;
+; Uses GetKeyState(, "P") to check physical key state.
+; "P" = physical state (actual hardware), not logical state.
+; This is reliable even while Send() is firing.
 
 #Requires AutoHotkey v2.0
 #SingleInstance Force
 
-; Scroll state flags
-scrollingUp := false
-scrollingDown := false
-
-; Register hotkeys
 ^Up:: {
-    global scrollingUp
-    scrollingUp := true
-    scrollingDown := false
-    SetTimer(ScrollUp, 50)
+    while (GetKeyState("Up", "P") && GetKeyState("Ctrl", "P")) {
+        Send("{WheelUp}")
+        Sleep(50)
+    }
 }
 
 ^Down:: {
-    global scrollingDown
-    scrollingDown := true
-    scrollingUp := false
-    SetTimer(ScrollDown, 50)
-}
-
-; Key release detection via KeyWait
-^Up Up:: {
-    global scrollingUp
-    scrollingUp := false
-    SetTimer(ScrollUp, 0)
-}
-
-^Down Up:: {
-    global scrollingDown
-    scrollingDown := false
-    SetTimer(ScrollDown, 0)
-}
-
-ScrollUp() {
-    global scrollingUp
-    if (!scrollingUp) {
-        SetTimer(ScrollUp, 0)
-        return
+    while (GetKeyState("Down", "P") && GetKeyState("Ctrl", "P")) {
+        Send("{WheelDown}")
+        Sleep(50)
     }
-    Send("{WheelUp}")
-}
-
-ScrollDown() {
-    global scrollingDown
-    if (!scrollingDown) {
-        SetTimer(ScrollDown, 0)
-        return
-    }
-    Send("{WheelDown}")
 }
