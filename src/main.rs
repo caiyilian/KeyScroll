@@ -64,6 +64,8 @@ extern "system" {
     fn RegCloseKey(h:isize)->i32;
     fn GetModuleFileNameW(h:isize,b:*mut u16,c:u32)->u32;
     fn ShellExecuteW(h:HWND,o:*const u16,f:*const u16,p:*const u16,d:*const u16,s:i32)->isize;
+    fn GetForegroundWindow()->HWND;
+    fn GetClassNameW(h:HWND,b:*mut u16,c:i32)->i32;
 }
 
 const WM_HOTKEY:u32=0x0312; const WM_TRAYICON:u32=0x8001; const WM_DESTROY:u32=2;
@@ -95,6 +97,24 @@ unsafe fn exe_path() -> Vec<u16> {
     let len = GetModuleFileNameW(0, buf.as_mut_ptr(), 1024);
     buf.truncate(len as usize);
     buf
+}
+
+unsafe fn get_foreground_class() -> String {
+    let hwnd = GetForegroundWindow();
+    if hwnd == 0 { return String::new(); }
+    let mut buf = [0u16; 128];
+    let len = GetClassNameW(hwnd, buf.as_mut_ptr(), 128);
+    if len <= 0 { return String::new(); }
+    String::from_utf16_lossy(&buf[..len as usize])
+}
+
+fn find_per_app_config(class: &str) -> Option<config::PerAppConfig> {
+    let path_str = CFG_PATH.lock().ok()?.clone()?;
+    let path = PathBuf::from(&path_str);
+    if !path.exists() { return None; }
+    let content = std::fs::read_to_string(path).ok()?;
+    let cfg: config::Config = toml::from_str(&content).ok()?;
+    cfg.per_app.into_iter().find(|p| class.contains(&p.window_class) || p.window_class.contains(class))
 }
 
 unsafe fn install_autostart() -> bool {
@@ -182,14 +202,18 @@ if let Ok(mut l) = LOGGER.lock() {
         let tip = w("KeyScroll - Keyboard Scroll");
         for i in 0..tip.len().min(128) { nid.szTip[i] = tip[i]; }
         Shell_NotifyIconW(NIM_ADD, &nid);
-        *CFG_PATH.lock().unwrap() = Some("config.toml".into());
+        // Load config
+        let (cfg, cfg_path) = config::load_config();
+        *CFG_PATH.lock().unwrap() = Some(cfg_path.to_str().unwrap_or("config.toml").to_string());
+        log_msg(&format!("Config loaded with {} per-app rules", cfg.per_app.len()));
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg,0,0,0) != 0 {
             if msg.message == WM_HOTKEY && !PAUSED.load(Ordering::SeqCst) {
                 let dir = match msg.wParam { 1|3 => "Up", _ => "Down" };
                 let hz = match msg.wParam { 3|4 => "Horiz", _ => "Vert" };
-                log_msg(&format!("Hotkey: {}/{}", hz, dir));
+                let fg = get_foreground_class();
+                log_msg(&format!("Hotkey: {}/{} fg:{}", hz, dir, &fg));
                 match msg.wParam {
                     1 | 2 | 3 | 4 => {
                         if JUMP_MODE.load(Ordering::SeqCst) {
