@@ -88,6 +88,8 @@ static PAUSED: AtomicBool = AtomicBool::new(false);
 static JUMP_MODE: AtomicBool = AtomicBool::new(false);
 static CFG_PATH: Mutex<Option<String>> = Mutex::new(None);
 static LOGGER: Mutex<Option<log::Logger>> = Mutex::new(None);
+static LAST_TRIGGER: AtomicU32 = AtomicU32::new(0);
+const MISFIRE_MS: u64 = 300;
 
 fn w(s: &str) -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() }
 
@@ -212,6 +214,16 @@ if let Ok(mut l) = LOGGER.lock() {
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg,0,0,0) != 0 {
             if msg.message == WM_HOTKEY && !PAUSED.load(Ordering::SeqCst) {
+                // Anti-misfire: ignore hotkeys triggered within MISFIRE_MS of previous
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u32)
+                    .unwrap_or(0);
+                let last = LAST_TRIGGER.load(Ordering::SeqCst);
+                if (now as u64) < (last as u64) + MISFIRE_MS && last != 0 {
+                    log_msg("Misfire suppressed");
+                } else {
+                    LAST_TRIGGER.store(now, Ordering::SeqCst);
                 let dir = match msg.wParam { 1|3 => "Up", _ => "Down" };
                 let hz = match msg.wParam { 3|4 => "Horiz", _ => "Vert" };
                 let fg = get_foreground_class();
@@ -236,6 +248,7 @@ if let Ok(mut l) = LOGGER.lock() {
                     }
                     _ => {}
                 }
+            }
             }
             TranslateMessage(&msg); DispatchMessageW(&msg);
         }
