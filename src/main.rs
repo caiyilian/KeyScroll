@@ -84,6 +84,8 @@ const KEY_SET_VALUE:u32=0x0002; const KEY_WRITE:u32=0x20006; const REG_SZ:u32=1;
 
 static V_GEN: AtomicU32 = AtomicU32::new(0);
 static H_GEN: AtomicU32 = AtomicU32::new(0);
+static SCROLLING_V: AtomicBool = AtomicBool::new(false);
+static SCROLLING_H: AtomicBool = AtomicBool::new(false);
 static PAUSED: AtomicBool = AtomicBool::new(false);
 static JUMP_MODE: AtomicBool = AtomicBool::new(false);
 static CFG_PATH: Mutex<Option<String>> = Mutex::new(None);
@@ -214,41 +216,45 @@ if let Ok(mut l) = LOGGER.lock() {
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg,0,0,0) != 0 {
             if msg.message == WM_HOTKEY && !PAUSED.load(Ordering::SeqCst) {
-                // Anti-misfire: ignore hotkeys triggered within MISFIRE_MS of previous
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u32)
-                    .unwrap_or(0);
-                let last = LAST_TRIGGER.load(Ordering::SeqCst);
-                if (now as u64) < (last as u64) + MISFIRE_MS && last != 0 {
-                    log_msg("Misfire suppressed");
-                } else {
-                    LAST_TRIGGER.store(now, Ordering::SeqCst);
-                let dir = match msg.wParam { 1|3 => "Up", _ => "Down" };
-                let hz = match msg.wParam { 3|4 => "Horiz", _ => "Vert" };
                 let fg = get_foreground_class();
-                log_msg(&format!("Hotkey: {}/{} fg:{}", hz, dir, &fg));
                 match msg.wParam {
                     1 | 2 | 3 | 4 => {
                         let h = hwnd;
-                        let dir = if msg.wParam == 1 || msg.wParam == 3 { "Up" } else { "Down" };
-                        let hz = if msg.wParam == 3 || msg.wParam == 4 { "Horiz" } else { "Vert" };
-                        set_tray_tip(h, &format!("KeyScroll - Scrolling {}/{}", hz, dir));
+                        let up = msg.wParam == 1 || msg.wParam == 3;
+                        let horiz = msg.wParam == 3 || msg.wParam == 4;
+                        let dir_label = if up { "Up" } else { "Down" };
+                        let hz_label = if horiz { "Horiz" } else { "Vert" };
+                        log_msg(&format!("Hotkey: {}/{} fg:{}", hz_label, dir_label, &fg));
                         if JUMP_MODE.load(Ordering::SeqCst) {
-                            let up = msg.wParam == 1 || msg.wParam == 3;
-                            let horiz = msg.wParam == 3 || msg.wParam == 4;
-                            std::thread::spawn(move||unsafe{ jump_scroll(up, horiz, h) });
+                            // Jump mode: anti-misfire prevents double-jumps from one tap
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u32)
+                                .unwrap_or(0);
+                            let last = LAST_TRIGGER.load(Ordering::SeqCst);
+                            if (now as u64) < (last as u64) + MISFIRE_MS && last != 0 {
+                                log_msg("Misfire suppressed");
+                            } else {
+                                LAST_TRIGGER.store(now, Ordering::SeqCst);
+                                set_tray_tip(h, &format!("KeyScroll - Scrolling {}/{}", hz_label, dir_label));
+                                std::thread::spawn(move||unsafe{ jump_scroll(up, horiz, h) });
+                            }
                         } else {
-                            let g = match msg.wParam { 1|2 => V_GEN.fetch_add(1,Ordering::SeqCst)+1, _ => H_GEN.fetch_add(1,Ordering::SeqCst)+1 };
-                            let up = msg.wParam == 1 || msg.wParam == 3;
-                            let horiz = msg.wParam == 3 || msg.wParam == 4;
-                            let gen: &AtomicU32 = if msg.wParam < 3 { &V_GEN } else { &H_GEN };
-                            std::thread::spawn(move||unsafe{ scroll(up, g, gen, horiz, h) });
+                            // Hold-to-scroll: skip if already scrolling in this direction
+                            let scrolling = if horiz { &SCROLLING_H } else { &SCROLLING_V };
+                            if scrolling.load(Ordering::SeqCst) {
+                                // Already scrolling — ignore repeat WM_HOTKEY
+                            } else {
+                                scrolling.store(true, Ordering::SeqCst);
+                                let g = match msg.wParam { 1|2 => V_GEN.fetch_add(1,Ordering::SeqCst)+1, _ => H_GEN.fetch_add(1,Ordering::SeqCst)+1 };
+                                let gen: &AtomicU32 = if msg.wParam < 3 { &V_GEN } else { &H_GEN };
+                                set_tray_tip(h, &format!("KeyScroll - Scrolling {}/{}", hz_label, dir_label));
+                                std::thread::spawn(move||unsafe{ scroll(up, g, gen, horiz, h) });
+                            }
                         }
                     }
                     _ => {}
                 }
-            }
             }
             TranslateMessage(&msg); DispatchMessageW(&msg);
         }
@@ -342,10 +348,11 @@ unsafe fn cmd(h:HWND,id:u32) {
 }
 
 unsafe fn scroll(up:bool,my_gen:u32,gen:&AtomicU32,horiz:bool,h:HWND) {
+    let flag: &AtomicBool = if horiz { &SCROLLING_H } else { &SCROLLING_V };
     let dir = if up { 1 } else { -1 };
     let start = Instant::now();
     loop {
-        if gen.load(Ordering::SeqCst) != my_gen { set_tray_tip(h, "KeyScroll - Keyboard Scroll"); return; }
+        if gen.load(Ordering::SeqCst) != my_gen { flag.store(false, Ordering::SeqCst); set_tray_tip(h, "KeyScroll - Keyboard Scroll"); return; }
         if GetAsyncKeyState(if up{0x26}else{0x28}) >= 0 { break; }
         let e = start.elapsed().as_millis() as u64;
         let (d,iv) = if e<500{(120,80)}else if e<2000{(240,40)}else{(480,20)};
@@ -355,12 +362,13 @@ unsafe fn scroll(up:bool,my_gen:u32,gen:&AtomicU32,horiz:bool,h:HWND) {
         std::thread::sleep(Duration::from_millis(iv));
     }
     for s in (1..=4usize).rev() {
-        if gen.load(Ordering::SeqCst) != my_gen { return; }
+        if gen.load(Ordering::SeqCst) != my_gen { flag.store(false, Ordering::SeqCst); return; }
         let flags = if horiz{MOUSEEVENTF_HWHEEL}else{MOUSEEVENTF_WHEEL};
         let mut buf=[0u32;7]; buf[0]=0; buf[5]=(30*s as i32*dir)as u32; buf[6]=flags;
         SendInput(1,&buf as *const u32,std::mem::size_of::<[u32;7]>()as i32);
         std::thread::sleep(Duration::from_millis(25));
     }
+    flag.store(false, Ordering::SeqCst);
     set_tray_tip(h, "KeyScroll - Keyboard Scroll");
 }
 
