@@ -9,6 +9,7 @@ mod config;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use std::env;
 
 // Win32 types
 type HWND = isize; type HINSTANCE = isize; type HICON = isize; type HMENU = isize;
@@ -31,7 +32,7 @@ struct NOTIFYICONDATAW {
     dwInfoFlags: u32, guidItem: [u8;16], hBalloonIcon: HICON,
 }
 
-#[link(name = "user32")] #[link(name = "shell32")] #[link(name = "comctl32")]
+#[link(name = "user32")] #[link(name = "shell32")] #[link(name = "comctl32")] #[link(name = "advapi32")]
 extern "system" {
     fn GetModuleHandleW(n: *const u16) -> HINSTANCE;
     fn RegisterClassW(w: *const WNDCLASSW) -> u16;
@@ -55,6 +56,11 @@ extern "system" {
     fn UnregisterHotKey(h:HWND,i:i32)->BOOL;
     fn GetAsyncKeyState(v:i32)->i16;
     fn SendInput(c:u32,p:*const u32,s:i32)->u32;
+    fn RegOpenKeyExW(h:isize,s:*const u16,o:u32,a:u32,r:*mut isize)->i32;
+    fn RegSetValueExW(h:isize,n:*const u16,z:u32,t:u32,d:*const u16,c:u32)->i32;
+    fn RegDeleteValueW(h:isize,n:*const u16)->i32;
+    fn RegCloseKey(h:isize)->i32;
+    fn GetModuleFileNameW(h:isize,b:*mut u16,c:u32)->u32;
 }
 
 const WM_HOTKEY:u32=0x0312; const WM_TRAYICON:u32=0x8001; const WM_DESTROY:u32=2;
@@ -66,6 +72,9 @@ const MF_STRING:u32=0; const MF_SEPARATOR:u32=0x0800;
 const TPM_LEFTALIGN:u32=0; const TPM_BOTTOMALIGN:u32=0x0020; const TPM_RIGHTBUTTON:u32=0x0800;
 const INPUT_MOUSE:u32=0; const MOUSEEVENTF_WHEEL:u32=0x0800; const MOUSEEVENTF_HWHEEL:u32=0x1000;
 const ID_EDIT:usize=1001; const ID_RELOAD:usize=1002; const ID_TOGGLE:usize=1003; const ID_EXIT:usize=1004;
+// Registry constants
+const HKEY_CURRENT_USER:isize = -2147483647i64 as isize;
+const KEY_SET_VALUE:u32=0x0002; const KEY_WRITE:u32=0x20006; const REG_SZ:u32=1; const ERROR_SUCCESS:i32=0;
 
 static V_GEN: AtomicU32 = AtomicU32::new(0);
 static H_GEN: AtomicU32 = AtomicU32::new(0);
@@ -74,8 +83,54 @@ static CFG_PATH: Mutex<Option<String>> = Mutex::new(None);
 
 fn w(s: &str) -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() }
 
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+
+unsafe fn exe_path() -> Vec<u16> {
+    let mut buf = vec![0u16; 1024];
+    let len = GetModuleFileNameW(0, buf.as_mut_ptr(), 1024);
+    buf.truncate(len as usize);
+    buf
+}
+
+unsafe fn install_autostart() -> bool {
+    let key = w(RUN_KEY);
+    let mut hkey: isize = 0;
+    let rc = RegOpenKeyExW(HKEY_CURRENT_USER, key.as_ptr(), 0, KEY_WRITE, &mut hkey);
+    if rc != ERROR_SUCCESS { return false; }
+    let path = exe_path();
+    let app = w("KeyScroll");
+    let r = RegSetValueExW(hkey, app.as_ptr(), 0, REG_SZ, path.as_ptr(), path.len() as u32 * 2);
+    RegCloseKey(hkey);
+    r == ERROR_SUCCESS
+}
+
+unsafe fn uninstall_autostart() -> bool {
+    let key = w(RUN_KEY);
+    let mut hkey: isize = 0;
+    let rc = RegOpenKeyExW(HKEY_CURRENT_USER, key.as_ptr(), 0, KEY_SET_VALUE, &mut hkey);
+    if rc != ERROR_SUCCESS { return false; }
+    let app = w("KeyScroll");
+    let r = RegDeleteValueW(hkey, app.as_ptr());
+    RegCloseKey(hkey);
+    r == ERROR_SUCCESS
+}
+
 fn main() {
     unsafe {
+        // Handle --install / --uninstall flags before entering GUI loop
+        let args: Vec<String> = env::args().collect();
+        if args.iter().any(|a| a == "--install" || a == "-i") {
+            if install_autostart() {
+                std::process::exit(0);
+            } else {
+                eprintln!("Failed to install auto-start (try running as admin?)");
+                std::process::exit(1);
+            }
+        }
+        if args.iter().any(|a| a == "--uninstall" || a == "-u") {
+            uninstall_autostart();
+            std::process::exit(0);
+        }
         let inst = GetModuleHandleW(std::ptr::null());
         let cls = w("KeyScrollWnd"); let ttl = w("KeyScroll");
         let wc = WNDCLASSW {
