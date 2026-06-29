@@ -66,6 +66,7 @@ extern "system" {
     fn ShellExecuteW(h:HWND,o:*const u16,f:*const u16,p:*const u16,d:*const u16,s:i32)->isize;
     fn GetForegroundWindow()->HWND;
     fn GetClassNameW(h:HWND,b:*mut u16,c:i32)->i32;
+    fn SetProcessDPIAware()->BOOL;
 }
 
 const WM_HOTKEY:u32=0x0312; const WM_TRAYICON:u32=0x8001; const WM_DESTROY:u32=2;
@@ -150,6 +151,7 @@ fn log_msg(msg: &str) {
 
 fn main() {
     unsafe {
+        SetProcessDPIAware();
         // Handle --install / --uninstall flags before entering GUI loop
         let args: Vec<String> = env::args().collect();
         if args.iter().any(|a| a == "--install" || a == "-i") {
