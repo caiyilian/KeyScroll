@@ -1,0 +1,31 @@
+# Token
+.github-token
+
+# Rust build
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Windows
+*.exe
+*.dll
+*.pdb
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store
+
+# OpenCode session data
+.omo/
+
+# Logs
+logs/
+*.log
