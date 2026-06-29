@@ -71,10 +71,10 @@ const WM_COMMAND:u32=0x0111; const WM_LBUTTONUP:u32=0x0202; const WM_RBUTTONUP:u
 const NIM_ADD:u32=0; const NIM_MODIFY:u32=1; const NIM_DELETE:u32=2;
 const NIF_MESSAGE:u32=1; const NIF_ICON:u32=2; const NIF_TIP:u32=4;
 const NIF_INFO:u32=16; const NIF_SHOWTIP:u32=64; const NIIF_INFO:u32=1;
-const MF_STRING:u32=0; const MF_SEPARATOR:u32=0x0800;
+const MF_STRING:u32=0; const MF_SEPARATOR:u32=0x0800; const MF_CHECKED:u32=0x0008;
 const TPM_LEFTALIGN:u32=0; const TPM_BOTTOMALIGN:u32=0x0020; const TPM_RIGHTBUTTON:u32=0x0800;
 const INPUT_MOUSE:u32=0; const MOUSEEVENTF_WHEEL:u32=0x0800; const MOUSEEVENTF_HWHEEL:u32=0x1000;
-const ID_EDIT:usize=1001; const ID_RELOAD:usize=1002; const ID_TOGGLE:usize=1003; const ID_EXIT:usize=1004; const ID_OPEN_LOG:usize=1005;
+const ID_EDIT:usize=1001; const ID_RELOAD:usize=1002; const ID_TOGGLE:usize=1003; const ID_EXIT:usize=1004; const ID_OPEN_LOG:usize=1005; const ID_JUMP_MODE:usize=1006;
 // Registry constants
 const HKEY_CURRENT_USER:isize = -2147483647i64 as isize;
 const KEY_SET_VALUE:u32=0x0002; const KEY_WRITE:u32=0x20006; const REG_SZ:u32=1; const ERROR_SUCCESS:i32=0;
@@ -82,6 +82,7 @@ const KEY_SET_VALUE:u32=0x0002; const KEY_WRITE:u32=0x20006; const REG_SZ:u32=1;
 static V_GEN: AtomicU32 = AtomicU32::new(0);
 static H_GEN: AtomicU32 = AtomicU32::new(0);
 static PAUSED: AtomicBool = AtomicBool::new(false);
+static JUMP_MODE: AtomicBool = AtomicBool::new(false);
 static CFG_PATH: Mutex<Option<String>> = Mutex::new(None);
 static LOGGER: Mutex<Option<log::Logger>> = Mutex::new(None);
 
@@ -190,10 +191,19 @@ if let Ok(mut l) = LOGGER.lock() {
                 let hz = match msg.wParam { 3|4 => "Horiz", _ => "Vert" };
                 log_msg(&format!("Hotkey: {}/{}", hz, dir));
                 match msg.wParam {
-                    1 => { let g=V_GEN.fetch_add(1,Ordering::SeqCst)+1; std::thread::spawn(move||unsafe{scroll(true,g,&V_GEN,false)}); }
-                    2 => { let g=V_GEN.fetch_add(1,Ordering::SeqCst)+1; std::thread::spawn(move||unsafe{scroll(false,g,&V_GEN,false)}); }
-                    3 => { let g=H_GEN.fetch_add(1,Ordering::SeqCst)+1; std::thread::spawn(move||unsafe{scroll(true,g,&H_GEN,true)}); }
-                    4 => { let g=H_GEN.fetch_add(1,Ordering::SeqCst)+1; std::thread::spawn(move||unsafe{scroll(false,g,&H_GEN,true)}); }
+                    1 | 2 | 3 | 4 => {
+                        if JUMP_MODE.load(Ordering::SeqCst) {
+                            let up = msg.wParam == 1 || msg.wParam == 3;
+                            let horiz = msg.wParam == 3 || msg.wParam == 4;
+                            std::thread::spawn(move||unsafe{ jump_scroll(up, horiz) });
+                        } else {
+                            let g = match msg.wParam { 1|2 => V_GEN.fetch_add(1,Ordering::SeqCst)+1, _ => H_GEN.fetch_add(1,Ordering::SeqCst)+1 };
+                            let up = msg.wParam == 1 || msg.wParam == 3;
+                            let horiz = msg.wParam == 3 || msg.wParam == 4;
+                            let gen: &AtomicU32 = if msg.wParam < 3 { &V_GEN } else { &H_GEN };
+                            std::thread::spawn(move||unsafe{ scroll(up, g, gen, horiz) });
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -221,6 +231,9 @@ unsafe fn show_menu(h:HWND) {
     AppendMenuW(m,MF_SEPARATOR,0,std::ptr::null());
     let p = if PAUSED.load(Ordering::SeqCst) { "Resume" } else { "Pause" };
     AppendMenuW(m,MF_STRING,ID_TOGGLE,w(p).as_ptr());
+    AppendMenuW(m,MF_SEPARATOR,0,std::ptr::null());
+    let jf = MF_STRING | if JUMP_MODE.load(Ordering::SeqCst) { MF_CHECKED } else { 0 };
+    AppendMenuW(m,jf,ID_JUMP_MODE,w("Jump Mode").as_ptr());
     AppendMenuW(m,MF_SEPARATOR,0,std::ptr::null());
     AppendMenuW(m,MF_STRING,ID_EXIT,w("Exit").as_ptr());
     SetForegroundWindow(h);
@@ -266,6 +279,10 @@ unsafe fn cmd(h:HWND,id:u32) {
             for i in 0..wide.len().min(128){n.szTip[i]=wide[i];}
             Shell_NotifyIconW(NIM_MODIFY,&n);
         }
+        ID_JUMP_MODE => {
+            JUMP_MODE.fetch_xor(true,Ordering::SeqCst);
+            if JUMP_MODE.load(Ordering::SeqCst) { log_msg("Jump Mode ON"); } else { log_msg("Jump Mode OFF"); }
+        }
         ID_EXIT => { log_msg("Shutdown"); PostQuitMessage(0); }
         _ => {}
     }
@@ -290,5 +307,15 @@ unsafe fn scroll(up:bool,my_gen:u32,gen:&AtomicU32,horiz:bool) {
         let mut buf=[0u32;7]; buf[0]=0; buf[5]=(30*s as i32*dir)as u32; buf[6]=flags;
         SendInput(1,&buf as *const u32,std::mem::size_of::<[u32;7]>()as i32);
         std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+unsafe fn jump_scroll(up:bool,horiz:bool) {
+    let dir:i32 = if up { 1 } else { -1 };
+    let flags = if horiz { MOUSEEVENTF_HWHEEL } else { MOUSEEVENTF_WHEEL };
+    for _ in 0..5 {
+        let mut buf=[0u32;7]; buf[0]=0; buf[5]=(120*dir)as u32; buf[6]=flags;
+        SendInput(1,&buf as *const u32,std::mem::size_of::<[u32;7]>()as i32);
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
