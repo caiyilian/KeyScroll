@@ -5,11 +5,13 @@
 #![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
 
 mod config;
+mod log;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use std::env;
+use std::path::PathBuf;
 
 // Win32 types
 type HWND = isize; type HINSTANCE = isize; type HICON = isize; type HMENU = isize;
@@ -61,6 +63,7 @@ extern "system" {
     fn RegDeleteValueW(h:isize,n:*const u16)->i32;
     fn RegCloseKey(h:isize)->i32;
     fn GetModuleFileNameW(h:isize,b:*mut u16,c:u32)->u32;
+    fn ShellExecuteW(h:HWND,o:*const u16,f:*const u16,p:*const u16,d:*const u16,s:i32)->isize;
 }
 
 const WM_HOTKEY:u32=0x0312; const WM_TRAYICON:u32=0x8001; const WM_DESTROY:u32=2;
@@ -71,7 +74,7 @@ const NIF_INFO:u32=16; const NIF_SHOWTIP:u32=64; const NIIF_INFO:u32=1;
 const MF_STRING:u32=0; const MF_SEPARATOR:u32=0x0800;
 const TPM_LEFTALIGN:u32=0; const TPM_BOTTOMALIGN:u32=0x0020; const TPM_RIGHTBUTTON:u32=0x0800;
 const INPUT_MOUSE:u32=0; const MOUSEEVENTF_WHEEL:u32=0x0800; const MOUSEEVENTF_HWHEEL:u32=0x1000;
-const ID_EDIT:usize=1001; const ID_RELOAD:usize=1002; const ID_TOGGLE:usize=1003; const ID_EXIT:usize=1004;
+const ID_EDIT:usize=1001; const ID_RELOAD:usize=1002; const ID_TOGGLE:usize=1003; const ID_EXIT:usize=1004; const ID_OPEN_LOG:usize=1005;
 // Registry constants
 const HKEY_CURRENT_USER:isize = -2147483647i64 as isize;
 const KEY_SET_VALUE:u32=0x0002; const KEY_WRITE:u32=0x20006; const REG_SZ:u32=1; const ERROR_SUCCESS:i32=0;
@@ -80,6 +83,7 @@ static V_GEN: AtomicU32 = AtomicU32::new(0);
 static H_GEN: AtomicU32 = AtomicU32::new(0);
 static PAUSED: AtomicBool = AtomicBool::new(false);
 static CFG_PATH: Mutex<Option<String>> = Mutex::new(None);
+static LOGGER: Mutex<Option<log::Logger>> = Mutex::new(None);
 
 fn w(s: &str) -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() }
 
@@ -115,6 +119,14 @@ unsafe fn uninstall_autostart() -> bool {
     r == ERROR_SUCCESS
 }
 
+fn log_msg(msg: &str) {
+    if let Ok(l) = LOGGER.lock() {
+        if let Some(ref logger) = *l {
+            logger.event(msg);
+        }
+    }
+}
+
 fn main() {
     unsafe {
         // Handle --install / --uninstall flags before entering GUI loop
@@ -131,6 +143,15 @@ fn main() {
             uninstall_autostart();
             std::process::exit(0);
         }
+        // Initialize logger next to exe
+        let path_bytes = exe_path();
+        let path_str = String::from_utf16_lossy(&path_bytes);
+        let p = PathBuf::from(&path_str);
+        let log_path = p.with_extension("log");
+if let Ok(mut l) = LOGGER.lock() {
+            *l = Some(log::Logger::new(log_path));
+        }
+        log_msg("KeyScroll started");
         let inst = GetModuleHandleW(std::ptr::null());
         let cls = w("KeyScrollWnd"); let ttl = w("KeyScroll");
         let wc = WNDCLASSW {
@@ -165,6 +186,9 @@ fn main() {
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg,0,0,0) != 0 {
             if msg.message == WM_HOTKEY && !PAUSED.load(Ordering::SeqCst) {
+                let dir = match msg.wParam { 1|3 => "Up", _ => "Down" };
+                let hz = match msg.wParam { 3|4 => "Horiz", _ => "Vert" };
+                log_msg(&format!("Hotkey: {}/{}", hz, dir));
                 match msg.wParam {
                     1 => { let g=V_GEN.fetch_add(1,Ordering::SeqCst)+1; std::thread::spawn(move||unsafe{scroll(true,g,&V_GEN,false)}); }
                     2 => { let g=V_GEN.fetch_add(1,Ordering::SeqCst)+1; std::thread::spawn(move||unsafe{scroll(false,g,&V_GEN,false)}); }
@@ -190,6 +214,8 @@ unsafe extern "system" fn callback(h:HWND,m:u32,w:WPARAM,l:LPARAM)->LRESULT {
 
 unsafe fn show_menu(h:HWND) {
     let m = CreatePopupMenu(); if m==0 { return; }
+    AppendMenuW(m,MF_STRING,ID_OPEN_LOG,w("Open Log").as_ptr());
+    AppendMenuW(m,MF_SEPARATOR,0,std::ptr::null());
     AppendMenuW(m,MF_STRING,ID_EDIT,w("Edit Config").as_ptr());
     AppendMenuW(m,MF_STRING,ID_RELOAD,w("Reload Config").as_ptr());
     AppendMenuW(m,MF_SEPARATOR,0,std::ptr::null());
@@ -217,9 +243,21 @@ unsafe fn show_info(h:HWND) {
 
 unsafe fn cmd(h:HWND,id:u32) {
     match id as usize {
+        ID_OPEN_LOG => {
+            let open = w("open");
+            let log_path_str = exe_path();
+            let log_path = {
+                let s = String::from_utf16_lossy(&log_path_str);
+                let p = PathBuf::from(&s);
+                w(p.with_extension("log").to_str().unwrap_or("keyscroll.log"))
+            };
+            ShellExecuteW(0, open.as_ptr(), log_path.as_ptr(), std::ptr::null(), std::ptr::null(), 1);
+        }
         ID_TOGGLE => {
             PAUSED.fetch_xor(true,Ordering::SeqCst);
-            let txt = if PAUSED.load(Ordering::SeqCst){"KeyScroll - Paused"}else{"KeyScroll - Resumed"};
+            let paused = PAUSED.load(Ordering::SeqCst);
+            log_msg(if paused{"Paused"}else{"Resumed"});
+            let txt = if paused{"KeyScroll - Paused"}else{"KeyScroll - Resumed"};
             let wide=w(txt);
             let mut n=NOTIFYICONDATAW{
                 cbSize:std::mem::size_of::<NOTIFYICONDATAW>()as u32,hWnd:h,uID:1,
@@ -228,7 +266,7 @@ unsafe fn cmd(h:HWND,id:u32) {
             for i in 0..wide.len().min(128){n.szTip[i]=wide[i];}
             Shell_NotifyIconW(NIM_MODIFY,&n);
         }
-        ID_EXIT => { PostQuitMessage(0); }
+        ID_EXIT => { log_msg("Shutdown"); PostQuitMessage(0); }
         _ => {}
     }
 }
