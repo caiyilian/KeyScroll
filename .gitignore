@@ -1,5 +1,6 @@
 # Token
 .github-token
+apikey
 
 # Rust build
 /target/
