@@ -216,16 +216,20 @@ if let Ok(mut l) = LOGGER.lock() {
                 log_msg(&format!("Hotkey: {}/{} fg:{}", hz, dir, &fg));
                 match msg.wParam {
                     1 | 2 | 3 | 4 => {
+                        let h = hwnd;
+                        let dir = if msg.wParam == 1 || msg.wParam == 3 { "Up" } else { "Down" };
+                        let hz = if msg.wParam == 3 || msg.wParam == 4 { "Horiz" } else { "Vert" };
+                        set_tray_tip(h, &format!("KeyScroll - Scrolling {}/{}", hz, dir));
                         if JUMP_MODE.load(Ordering::SeqCst) {
                             let up = msg.wParam == 1 || msg.wParam == 3;
                             let horiz = msg.wParam == 3 || msg.wParam == 4;
-                            std::thread::spawn(move||unsafe{ jump_scroll(up, horiz) });
+                            std::thread::spawn(move||unsafe{ jump_scroll(up, horiz, h) });
                         } else {
                             let g = match msg.wParam { 1|2 => V_GEN.fetch_add(1,Ordering::SeqCst)+1, _ => H_GEN.fetch_add(1,Ordering::SeqCst)+1 };
                             let up = msg.wParam == 1 || msg.wParam == 3;
                             let horiz = msg.wParam == 3 || msg.wParam == 4;
                             let gen: &AtomicU32 = if msg.wParam < 3 { &V_GEN } else { &H_GEN };
-                            std::thread::spawn(move||unsafe{ scroll(up, g, gen, horiz) });
+                            std::thread::spawn(move||unsafe{ scroll(up, g, gen, horiz, h) });
                         }
                     }
                     _ => {}
@@ -234,6 +238,16 @@ if let Ok(mut l) = LOGGER.lock() {
             TranslateMessage(&msg); DispatchMessageW(&msg);
         }
     }
+}
+
+unsafe fn set_tray_tip(h: HWND, txt: &str) {
+    let wide = w(txt);
+    let mut n = NOTIFYICONDATAW{
+        cbSize:std::mem::size_of::<NOTIFYICONDATAW>()as u32,hWnd:h,uID:1,
+        uFlags:NIF_TIP,..std::mem::zeroed()
+    };
+    for i in 0..wide.len().min(128){n.szTip[i]=wide[i];}
+    Shell_NotifyIconW(NIM_MODIFY,&n);
 }
 
 unsafe extern "system" fn callback(h:HWND,m:u32,w:WPARAM,l:LPARAM)->LRESULT {
@@ -312,11 +326,11 @@ unsafe fn cmd(h:HWND,id:u32) {
     }
 }
 
-unsafe fn scroll(up:bool,my_gen:u32,gen:&AtomicU32,horiz:bool) {
+unsafe fn scroll(up:bool,my_gen:u32,gen:&AtomicU32,horiz:bool,h:HWND) {
     let dir = if up { 1 } else { -1 };
     let start = Instant::now();
     loop {
-        if gen.load(Ordering::SeqCst) != my_gen { return; }
+        if gen.load(Ordering::SeqCst) != my_gen { set_tray_tip(h, "KeyScroll - Keyboard Scroll"); return; }
         if GetAsyncKeyState(if up{0x26}else{0x28}) >= 0 { break; }
         let e = start.elapsed().as_millis() as u64;
         let (d,iv) = if e<500{(120,80)}else if e<2000{(240,40)}else{(480,20)};
@@ -332,9 +346,10 @@ unsafe fn scroll(up:bool,my_gen:u32,gen:&AtomicU32,horiz:bool) {
         SendInput(1,&buf as *const u32,std::mem::size_of::<[u32;7]>()as i32);
         std::thread::sleep(Duration::from_millis(25));
     }
+    set_tray_tip(h, "KeyScroll - Keyboard Scroll");
 }
 
-unsafe fn jump_scroll(up:bool,horiz:bool) {
+unsafe fn jump_scroll(up:bool,horiz:bool,h:HWND) {
     let dir:i32 = if up { 1 } else { -1 };
     let flags = if horiz { MOUSEEVENTF_HWHEEL } else { MOUSEEVENTF_WHEEL };
     for _ in 0..5 {
@@ -342,4 +357,5 @@ unsafe fn jump_scroll(up:bool,horiz:bool) {
         SendInput(1,&buf as *const u32,std::mem::size_of::<[u32;7]>()as i32);
         std::thread::sleep(Duration::from_millis(50));
     }
+    set_tray_tip(h, "KeyScroll - Keyboard Scroll");
 }
