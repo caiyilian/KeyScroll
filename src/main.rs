@@ -1,16 +1,17 @@
 ﻿// KeyScroll - Rust core
-// Phase 2.1: Acceleration curve — scroll speed increases with hold duration.
-// Uses RegisterHotKey + thread-local message loop.
+// Phase 2.2: Smooth stop + generation counter for reliable re-press handling
 
 #![windows_subsystem = "windows"]
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-static SCROLL_UP: AtomicBool = AtomicBool::new(false);
-static SCROLL_DOWN: AtomicBool = AtomicBool::new(false);
+static SCROLL_UP_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SCROLL_DOWN_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SCROLL_UP_GEN: AtomicU32 = AtomicU32::new(0);
+static SCROLL_DOWN_GEN: AtomicU32 = AtomicU32::new(0);
 
 fn main() {
     unsafe {
@@ -33,43 +34,54 @@ fn main() {
 }
 
 fn toggle_scroll(up: bool) {
+    // Stop opposite direction, increment generation for current direction
     if up {
-        SCROLL_DOWN.store(false, Ordering::SeqCst);
-        if SCROLL_UP.swap(true, Ordering::SeqCst) { return; }
+        SCROLL_DOWN_ACTIVE.store(false, Ordering::SeqCst);
+        SCROLL_DOWN_GEN.fetch_add(1, Ordering::SeqCst);
     } else {
-        SCROLL_UP.store(false, Ordering::SeqCst);
-        if SCROLL_DOWN.swap(true, Ordering::SeqCst) { return; }
+        SCROLL_UP_ACTIVE.store(false, Ordering::SeqCst);
+        SCROLL_UP_GEN.fetch_add(1, Ordering::SeqCst);
     }
 
+    let gen_counter = if up { &SCROLL_UP_GEN } else { &SCROLL_DOWN_GEN };
+    let active_flag = if up { &SCROLL_UP_ACTIVE } else { &SCROLL_DOWN_ACTIVE };
+    let my_gen = gen_counter.fetch_add(1, Ordering::SeqCst) + 1;
+    active_flag.store(true, Ordering::SeqCst);
+
     std::thread::spawn(move || {
-        let active = if up { &SCROLL_UP } else { &SCROLL_DOWN };
-        unsafe { scroll_loop(up, active) }
+        unsafe { scroll_loop(up, my_gen) }
     });
 }
 
-unsafe fn scroll_loop(up: bool, active: &AtomicBool) {
+unsafe fn scroll_loop(up: bool, my_gen: u32) {
     let key = if up { VK_UP.0 as i32 } else { VK_DOWN.0 as i32 };
     let direction = if up { 1 } else { -1 };
+    let gen = if up { &SCROLL_UP_GEN } else { &SCROLL_DOWN_GEN };
     let start = Instant::now();
 
+    // --- Active scrolling ---
     loop {
-        if !active.load(Ordering::SeqCst) { break; }
-        if GetAsyncKeyState(key) >= 0 {
-            active.store(false, Ordering::SeqCst);
-            break;
-        }
+        if gen.load(Ordering::SeqCst) != my_gen { return; }
+        if GetAsyncKeyState(key) >= 0 { break; }
 
         let elapsed = start.elapsed();
         let (delta, interval) = if elapsed < Duration::from_millis(500) {
-            (120, 80)       // slow: 1 notch every 80ms
+            (120, 80)
         } else if elapsed < Duration::from_millis(2000) {
-            (240, 40)       // medium: 2 notches every 40ms
+            (240, 40)
         } else {
-            (480, 20)       // fast: 4 notches every 20ms
+            (480, 20)
         };
 
         send_wheel(delta * direction);
         std::thread::sleep(Duration::from_millis(interval));
+    }
+
+    // --- Smooth stop (100ms linear decay) ---
+    for step in (1..=4).rev() {
+        if gen.load(Ordering::SeqCst) != my_gen { return; }
+        send_wheel(30 * step * direction);
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
